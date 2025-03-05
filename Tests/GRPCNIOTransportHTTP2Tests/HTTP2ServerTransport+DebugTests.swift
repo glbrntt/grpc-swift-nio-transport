@@ -124,6 +124,9 @@ struct ChannelDebugCallbackTests {
         )
       )
     #endif
+
+    case .tunnel:
+      fatalError("Unsupported")
     }
   }
 
@@ -155,6 +158,9 @@ struct ChannelDebugCallbackTests {
         )
       )
     #endif
+
+    case .tunnel:
+      fatalError("Unsupported")
     }
   }
 }

@@ -31,8 +31,8 @@ struct HTTP2TransportTLSEnabledTests {
 
   @Test(
     "When using defaults, server does not perform client verification",
-    arguments: TransportKind.supported,
-    TransportKind.supported
+    arguments: TransportKind.clientsWithTLS,
+    TransportKind.serversWithTLS
   )
   func testRPC_Defaults_OK(
     clientTransport: TransportKind,
@@ -60,8 +60,8 @@ struct HTTP2TransportTLSEnabledTests {
 
   @Test(
     "When using mTLS defaults, both client and server verify each others' certificates",
-    arguments: TransportKind.supported,
-    TransportKind.supported
+    arguments: TransportKind.clientsWithTLS,
+    TransportKind.clientsWithTLS
   )
   func testRPC_mTLS_OK(
     clientTransport: TransportKind,
@@ -91,8 +91,8 @@ struct HTTP2TransportTLSEnabledTests {
 
   @Test(
     "Error is surfaced when client fails server verification",
-    arguments: TransportKind.supported,
-    TransportKind.supported
+    arguments: TransportKind.clientsWithTLS,
+    TransportKind.clientsWithTLS
   )
   // Verification should fail because the custom hostname is missing on the client.
   func testClientFailsServerValidation(
@@ -146,6 +146,9 @@ struct HTTP2TransportTLSEnabledTests {
           return false
         }
       #endif
+
+      case .tunnel:
+        fatalError("Unsupported")
       }
 
       return true
@@ -154,8 +157,8 @@ struct HTTP2TransportTLSEnabledTests {
 
   @Test(
     "Error is surfaced when server fails client verification",
-    arguments: TransportKind.supported,
-    TransportKind.supported
+    arguments: TransportKind.clientsWithTLS,
+    TransportKind.clientsWithTLS
   )
   // Verification should fail because the client does not offer a cert that
   // the server can use for mutual verification.
@@ -218,6 +221,9 @@ struct HTTP2TransportTLSEnabledTests {
           return false
         }
       #endif
+
+      case .tunnel:
+        fatalError("Unsupported")
       }
 
       return true
@@ -319,6 +325,9 @@ struct HTTP2TransportTLSEnabledTests {
       config.transport.http2.authority = authority
       return .transportServices(config)
     #endif
+
+    case .tunnel:
+      fatalError("Unsupported")
     }
   }
 
@@ -390,6 +399,9 @@ struct HTTP2TransportTLSEnabledTests {
       config.transport.http2.authority = serverHostname
       return .transportServices(config)
     #endif
+
+    case .tunnel:
+      fatalError("Unsupported")
     }
   }
 
@@ -427,6 +439,9 @@ struct HTTP2TransportTLSEnabledTests {
       }
       return .transportServices(config)
     #endif
+
+    case .tunnel:
+      fatalError("Unsupported")
     }
   }
 
@@ -467,6 +482,9 @@ struct HTTP2TransportTLSEnabledTests {
       }
       return .transportServices(config)
     #endif
+
+    case .tunnel:
+      fatalError("Unsupported")
     }
   }
 

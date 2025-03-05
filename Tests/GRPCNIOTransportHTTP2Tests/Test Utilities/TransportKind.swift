@@ -22,9 +22,22 @@ enum TransportKind: CaseIterable, Hashable, Sendable {
   #if canImport(Network)
   case transportServices
   #endif
+  case tunnel
 
-  static var supported: [Self] {
+  static var clients: [Self] {
     Self.allCases
+  }
+
+  static var clientsWithTLS: [Self] {
+    Self.allCases.filter { $0 != .tunnel }
+  }
+
+  static var servers: [Self] {
+    Self.allCases.filter { $0 != .tunnel }
+  }
+
+  static var serversWithTLS: [Self] {
+    Self.allCases.filter { $0 != .tunnel }
   }
 }
 
@@ -33,6 +46,7 @@ enum NIOClientTransport: ClientTransport {
   #if canImport(Network)
   case transportServices(HTTP2ClientTransport.TransportServices)
   #endif
+  case tunnel(GRPCTunnelClientTransport)
 
   init(_ transport: HTTP2ClientTransport.Posix) {
     self = .posix(transport)
@@ -44,6 +58,10 @@ enum NIOClientTransport: ClientTransport {
   }
   #endif
 
+  init(_ transport: GRPCTunnelClientTransport) {
+    self = .tunnel(transport)
+  }
+
   typealias Bytes = GRPCNIOTransportBytes
 
   var retryThrottle: GRPCCore.RetryThrottle? {
@@ -54,6 +72,8 @@ enum NIOClientTransport: ClientTransport {
     case .transportServices(let transport):
       return transport.retryThrottle
     #endif
+    case .tunnel(let transport):
+      return transport.retryThrottle
     }
   }
 
@@ -65,6 +85,8 @@ enum NIOClientTransport: ClientTransport {
     case .transportServices(let transport):
       try await transport.connect()
     #endif
+    case .tunnel(let transport):
+      try await transport.connect()
     }
   }
 
@@ -76,6 +98,8 @@ enum NIOClientTransport: ClientTransport {
     case .transportServices(let transport):
       transport.beginGracefulShutdown()
     #endif
+    case .tunnel(let transport):
+      transport.beginGracefulShutdown()
     }
   }
 
@@ -91,6 +115,8 @@ enum NIOClientTransport: ClientTransport {
     case .transportServices(let transport):
       return try await transport.withStream(descriptor: descriptor, options: options, closure)
     #endif
+    case .tunnel(let transport):
+      return try await transport.withStream(descriptor: descriptor, options: options, closure)
     }
   }
 
@@ -102,6 +128,8 @@ enum NIOClientTransport: ClientTransport {
     case .transportServices(let transport):
       return transport.config(forMethod: descriptor)
     #endif
+    case .tunnel(let transport):
+      return transport.config(forMethod: descriptor)
     }
   }
 
