@@ -20,20 +20,20 @@ private import Synchronization
 /// A ``Subchannel`` provides communication to a single ``Endpoint``.
 ///
 /// Each ``Subchannel`` starts in an 'idle' state where it isn't attempting to connect to an
-/// endpoint. You can tell it to start connecting by calling ``connect()`` and you can listen
-/// to connectivity state changes by consuming the ``events`` sequence.
+/// endpoint. You can tell it to start connecting by calling ``connect()`` and connectivity
+/// state changes are delivered via the event listener callback provided during initialization.
 ///
 /// You must call ``shutDown()`` on the ``Subchannel`` when it's no longer required. This will move
 /// it to the ``ConnectivityState/shutdown`` state: existing RPCs may continue but all subsequent
 /// calls to ``makeStream(descriptor:options:)`` will fail.
 ///
-/// To use the ``Subchannel`` you must run it in a task:
+/// To use the ``Subchannel`` you must run it in a task and provide an event listener callback:
 ///
 /// ```swift
 /// await withTaskGroup(of: Void.self) { group in
-///   group.addTask { await subchannel.run() }
-///
-///   for await event in subchannel.events {
+///   let subchannel = Subchannel(
+///     // ... other parameters ...
+///   ) { event, subchannelID in
 ///     switch event {
 ///     case .connectivityStateChanged(.ready):
 ///       // ...
@@ -41,6 +41,7 @@ private import Synchronization
 ///       // ...
 ///     }
 ///   }
+///   group.addTask { await subchannel.run() }
 /// }
 /// ```
 @available(gRPCSwiftNIOTransport 2.0, *)
@@ -58,16 +59,18 @@ package final class Subchannel: Sendable {
   private enum Input: Sendable {
     /// Request that the connection starts connecting.
     case connect
-    /// A backoff period has ended.
-    case backedOff
-    /// Shuts down the connection, if possible.
-    case shutDown
-    /// Handle the event from the underlying connection object.
-    case handleConnectionEvent(Connection.Event)
+    /// Call `run()` on the given connection.
+    case runConnection(Connection)
+    /// Back off until the given instance.
+    case backoffUntil(ContinuousClock.Instant)
   }
 
-  /// Events which can happen to the subchannel.
-  private let event: (stream: AsyncStream<Event>, continuation: AsyncStream<Event>.Continuation)
+  /// A callback to notify a parent object of various state change events.
+  ///
+  /// Previously this was as async stream of events consumed by a parent object. However,
+  /// this introduced timing windows between publishing the event and it being consumed which
+  /// introduces errors further up the stack.
+  private let eventListener: @Sendable (_ event: Event?, _ id: SubchannelID) -> Void
 
   /// Inputs which this subchannel should react to.
   private let input: (stream: AsyncStream<Input>, continuation: AsyncStream<Input>.Continuation)
@@ -104,7 +107,8 @@ package final class Subchannel: Sendable {
     authority: String?,
     backoff: Backoff,
     defaultCompression: CompressionAlgorithm,
-    enabledCompression: CompressionAlgorithmSet
+    enabledCompression: CompressionAlgorithmSet,
+    eventListener: @Sendable @escaping (_ event: Event?, _ id: SubchannelID) -> Void
   ) {
     assert(!endpoint.addresses.isEmpty, "endpoint.addresses mustn't be empty")
 
@@ -116,20 +120,13 @@ package final class Subchannel: Sendable {
     self.backoff = backoff
     self.defaultCompression = defaultCompression
     self.enabledCompression = enabledCompression
-    self.event = AsyncStream.makeStream(of: Event.self)
+    self.eventListener = eventListener
     self.input = AsyncStream.makeStream(of: Input.self)
-    // Subchannel always starts in the idle state.
-    self.event.continuation.yield(.connectivityStateChanged(.idle))
   }
 }
 
 @available(gRPCSwiftNIOTransport 2.0, *)
 extension Subchannel {
-  /// A stream of events which can happen to the subchannel.
-  package var events: AsyncStream<Event> {
-    self.event.stream
-  }
-
   /// Run the subchannel.
   ///
   /// Running the subchannel will attempt to maintain a connection to a remote endpoint. At times
@@ -137,19 +134,46 @@ extension Subchannel {
   /// connect attempts fail then the subchannel may progressively spend longer in a transient
   /// failure state.
   ///
-  /// Events and state changes can be observed via the ``events`` stream.
+  /// Events and state changes are delivered to the event listener callback provided during
+  /// initialization.
   package func run() async {
+    // Become idle when 'run()' is called.
+    self.eventListener(.connectivityStateChanged(.idle), self.id)
+
     await withDiscardingTaskGroup { group in
       for await input in self.input.stream {
         switch input {
+        case .runConnection(let connection):
+          group.addTask {
+            await connection.run()
+          }
+
+        case .backoffUntil(let instant):
+          group.addTask {
+            do {
+              try await Task.sleep(until: instant, tolerance: .zero)
+
+              switch self.state.withLock({ $0.backedOff() }) {
+              case .none:
+                ()
+
+              case .finish:
+                self.eventListener(nil, self.id)
+                self.input.continuation.finish()
+
+              case .connect(let connection):
+                // About to start connecting, emit a state change event.
+                self.eventListener(.connectivityStateChanged(.connecting), self.id)
+                self.input.continuation.yield(.runConnection(connection))
+              }
+            } catch {
+              // Can only be a cancellation error, swallow it. No further connection attempts will
+              // be made.
+            }
+          }
+
         case .connect:
           self.handleConnectInput(in: &group)
-        case .backedOff:
-          self.handleBackedOffInput(in: &group)
-        case .shutDown:
-          self.handleShutDownInput(in: &group)
-        case .handleConnectionEvent(let event):
-          self.handleConnectionEvent(event, in: &group)
         }
       }
     }
@@ -157,7 +181,7 @@ extension Subchannel {
     // Once the task group is done, the event stream must also be finished. In normal operation
     // this is handled via other paths. For cancellation it must be finished explicitly.
     if Task.isCancelled {
-      self.event.continuation.finish()
+      self.eventListener(nil, self.id)
     }
   }
 
@@ -168,7 +192,26 @@ extension Subchannel {
 
   /// Initiates graceful shutdown, if possible.
   package func shutDown() {
-    self.input.continuation.yield(.shutDown)
+    switch self.state.withLock({ $0.shutDown() }) {
+    case .none:
+      ()
+
+    case .emitShutdown:
+      // Connection closed because the load balancer asked it to, so notify the load balancer.
+      self.eventListener(.connectivityStateChanged(.shutdown), self.id)
+
+    case .emitShutdownAndClose(let connection):
+      // Connection closed because the load balancer asked it to, so notify the load balancer.
+      self.eventListener(.connectivityStateChanged(.shutdown), self.id)
+      connection.close()
+
+    case .emitShutdownAndFinish:
+      // Connection closed because the load balancer asked it to, so notify the load balancer.
+      self.eventListener(.connectivityStateChanged(.shutdown), self.id)
+      // At this point there are no more events: close the event streams.
+      self.eventListener(nil, self.id)
+      self.input.continuation.finish()
+    }
   }
 
   /// Make a stream using the subchannel if it's ready.
@@ -206,7 +249,8 @@ extension Subchannel {
         authority: self.authority,
         backoff: self.backoff,
         defaultCompression: self.defaultCompression,
-        enabledCompression: self.enabledCompression
+        enabledCompression: self.enabledCompression,
+        eventListener: { self.handleConnectionEvent($0) }
       )
     }
 
@@ -216,62 +260,24 @@ extension Subchannel {
     }
 
     // About to start connecting a new connection; emit a state change event.
-    self.event.continuation.yield(.connectivityStateChanged(.connecting))
-    self.runConnection(connection, in: &group)
-  }
-
-  private func handleBackedOffInput(in group: inout DiscardingTaskGroup) {
-    switch self.state.withLock({ $0.backedOff() }) {
-    case .none:
-      ()
-
-    case .finish:
-      self.event.continuation.finish()
-      self.input.continuation.finish()
-
-    case .connect(let connection):
-      // About to start connecting, emit a state change event.
-      self.event.continuation.yield(.connectivityStateChanged(.connecting))
-      self.runConnection(connection, in: &group)
+    self.eventListener(.connectivityStateChanged(.connecting), self.id)
+    group.addTask {
+      await connection.run()
     }
   }
 
-  private func handleShutDownInput(in group: inout DiscardingTaskGroup) {
-    switch self.state.withLock({ $0.shutDown() }) {
-    case .none:
-      ()
-
-    case .emitShutdown:
-      // Connection closed because the load balancer asked it to, so notify the load balancer.
-      self.event.continuation.yield(.connectivityStateChanged(.shutdown))
-
-    case .emitShutdownAndClose(let connection):
-      // Connection closed because the load balancer asked it to, so notify the load balancer.
-      self.event.continuation.yield(.connectivityStateChanged(.shutdown))
-      connection.close()
-
-    case .emitShutdownAndFinish:
-      // Connection closed because the load balancer asked it to, so notify the load balancer.
-      self.event.continuation.yield(.connectivityStateChanged(.shutdown))
-      // At this point there are no more events: close the event streams.
-      self.event.continuation.finish()
-      self.input.continuation.finish()
-    }
-  }
-
-  private func handleConnectionEvent(
-    _ event: Connection.Event,
-    in group: inout DiscardingTaskGroup
-  ) {
+  private func handleConnectionEvent(_ event: Connection.Event?) {
     switch event {
     case .connectSucceeded:
       self.handleConnectSucceededEvent()
     case .connectFailed(let cause):
-      self.handleConnectFailedEvent(in: &group, error: cause)
+      self.handleConnectFailedEvent(error: cause)
     case .goingAway:
       self.handleGoingAwayEvent()
     case .closed(let reason):
-      self.handleConnectionClosedEvent(reason, in: &group)
+      self.handleConnectionClosedEvent(reason)
+    case nil:
+      ()
     }
   }
 
@@ -279,11 +285,11 @@ extension Subchannel {
     switch self.state.withLock({ $0.connectSucceeded() }) {
     case .updateStateToReady:
       // Emit a connectivity state change: the load balancer can now use this subchannel.
-      self.event.continuation.yield(.connectivityStateChanged(.ready))
+      self.eventListener(.connectivityStateChanged(.ready), self.id)
 
     case .finishAndClose(let connection):
-      self.event.continuation.yield(.connectivityStateChanged(.shutdown))
-      self.event.continuation.finish()
+      self.eventListener(.connectivityStateChanged(.shutdown), self.id)
+      self.eventListener(nil, self.id)
       self.input.continuation.finish()
       connection.close()
 
@@ -292,36 +298,26 @@ extension Subchannel {
     }
   }
 
-  private func handleConnectFailedEvent(in group: inout DiscardingTaskGroup, error: RPCError) {
-    let onConnectFailed = self.state.withLock {
-      $0.connectFailed(connector: self.connector, authority: self.authority)
+  private func handleConnectFailedEvent(error: RPCError) {
+    let onConnectFailed = self.state.withLock { state in
+      state.connectFailed(
+        connector: self.connector,
+        authority: self.authority,
+        eventListener: { self.handleConnectionEvent($0) }
+      )
     }
 
     switch onConnectFailed {
     case .connect(let connection):
-      // Try the next address.
-      self.runConnection(connection, in: &group)
+      self.input.continuation.yield(.runConnection(connection))
 
     case .backoff(let duration):
       // All addresses have been tried, backoff for some time.
-      self.event.continuation.yield(
-        .connectivityStateChanged(
-          .transientFailure(cause: error)
-        )
-      )
-      group.addTask {
-        do {
-          try await Task.sleep(for: duration, tolerance: .zero)
-          self.input.continuation.yield(.backedOff)
-        } catch {
-          // Can only be a cancellation error, swallow it. No further connection attempts will be
-          // made.
-          ()
-        }
-      }
+      self.eventListener(.connectivityStateChanged(.transientFailure(cause: error)), self.id)
+      self.input.continuation.yield(.backoffUntil(.now + duration))
 
     case .finish:
-      self.event.continuation.finish()
+      self.eventListener(nil, self.id)
       self.input.continuation.finish()
 
     case .none:
@@ -334,50 +330,35 @@ extension Subchannel {
     guard isGoingAway else { return }
 
     // Notify the load balancer that the subchannel is going away to stop it from being used.
-    self.event.continuation.yield(.goingAway)
+    self.eventListener(.goingAway, self.id)
     // A GOAWAY also means that the load balancer should re-resolve as the available servers
     // may have changed.
-    self.event.continuation.yield(.requiresNameResolution)
+    self.eventListener(.requiresNameResolution, self.id)
   }
 
-  private func handleConnectionClosedEvent(
-    _ reason: Connection.CloseReason,
-    in group: inout DiscardingTaskGroup
-  ) {
+  private func handleConnectionClosedEvent(_ reason: Connection.CloseReason) {
     switch self.state.withLock({ $0.closed(reason: reason) }) {
     case .nothing:
       ()
 
     case .emitIdle:
-      self.event.continuation.yield(.connectivityStateChanged(.idle))
+      self.eventListener(.connectivityStateChanged(.idle), self.id)
 
     case .emitTransientFailureAndReconnect(let cause):
       // Unclean closes trigger a transient failure state change and a name resolution.
-      self.event.continuation.yield(.connectivityStateChanged(.transientFailure(cause: cause)))
-      self.event.continuation.yield(.requiresNameResolution)
+      self.eventListener(.connectivityStateChanged(.transientFailure(cause: cause)), self.id)
+      self.eventListener(.requiresNameResolution, self.id)
       // Attempt to reconnect.
-      self.handleConnectInput(in: &group)
+      self.input.continuation.yield(.connect)
 
     case .finish(let emitShutdown):
       if emitShutdown {
-        self.event.continuation.yield(.connectivityStateChanged(.shutdown))
+        self.eventListener(.connectivityStateChanged(.shutdown), self.id)
       }
 
       // At this point there are no more events: close the event streams.
-      self.event.continuation.finish()
+      self.eventListener(nil, self.id)
       self.input.continuation.finish()
-    }
-  }
-
-  private func runConnection(_ connection: Connection, in group: inout DiscardingTaskGroup) {
-    group.addTask {
-      await connection.run()
-    }
-
-    group.addTask {
-      for await event in connection.events {
-        self.input.continuation.yield(.handleConnectionEvent(event))
-      }
     }
   }
 }
@@ -488,7 +469,8 @@ extension Subchannel {
       authority: String?,
       backoff: Backoff,
       defaultCompression: CompressionAlgorithm,
-      enabledCompression: CompressionAlgorithmSet
+      enabledCompression: CompressionAlgorithmSet,
+      eventListener: @escaping @Sendable (_ event: Connection.Event?) -> Void
     ) -> Connection? {
       switch self {
       case .notConnected:
@@ -500,7 +482,8 @@ extension Subchannel {
           authority: authority,
           http2Connector: connector,
           defaultCompression: defaultCompression,
-          enabledCompression: enabledCompression
+          enabledCompression: enabledCompression,
+          eventListener: eventListener
         )
 
         let connecting = State.Connecting(
@@ -583,7 +566,8 @@ extension Subchannel {
 
     mutating func connectFailed(
       connector: any HTTP2Connector,
-      authority: String?
+      authority: String?,
+      eventListener: @escaping @Sendable (_ event: Connection.Event?) -> Void
     ) -> OnConnectFailed {
       let onConnectFailed: OnConnectFailed
 
@@ -595,7 +579,8 @@ extension Subchannel {
             authority: authority,
             http2Connector: connector,
             defaultCompression: .none,
-            enabledCompression: .all
+            enabledCompression: .all,
+            eventListener: eventListener
           )
           self = .connecting(state)
           onConnectFailed = .connect(state.connection)
@@ -607,7 +592,8 @@ extension Subchannel {
             authority: authority,
             http2Connector: connector,
             defaultCompression: .none,
-            enabledCompression: .all
+            enabledCompression: .all,
+            eventListener: eventListener
           )
           let backoff = state.backoff.next()
           self = .connecting(state)

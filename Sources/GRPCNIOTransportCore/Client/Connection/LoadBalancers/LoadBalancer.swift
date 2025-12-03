@@ -35,15 +35,6 @@ extension LoadBalancer {
     }
   }
 
-  package var events: AsyncStream<LoadBalancerEvent> {
-    switch self {
-    case .roundRobin(let loadBalancer):
-      return loadBalancer.events
-    case .pickFirst(let loadBalancer):
-      return loadBalancer.events
-    }
-  }
-
   package func run() async {
     switch self {
     case .roundRobin(let loadBalancer):

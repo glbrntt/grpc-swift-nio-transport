@@ -303,7 +303,7 @@ final class RoundRobinLoadBalancerTests: XCTestCase {
       backoff: .defaults,
       defaultCompression: .none,
       enabledCompression: .none
-    )
+    ) { _, _ in }
 
     XCTAssertNil(loadBalancer.pickSubchannel())
   }
@@ -315,7 +315,7 @@ final class RoundRobinLoadBalancerTests: XCTestCase {
       backoff: .defaults,
       defaultCompression: .none,
       enabledCompression: .none
-    )
+    ) { _, _ in }
 
     loadBalancer.close()
     await loadBalancer.run()

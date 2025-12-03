@@ -28,10 +28,21 @@ private import Synchronization
 /// it to the ``ConnectivityState/shutdown`` state: existing RPCs may continue but all subsequent
 /// calls to ``makeStream(descriptor:options:)`` will fail.
 ///
-/// To use this load-balancer you must run it in a task:
+/// To use this load-balancer you must run it in a task and provide an event listener callback:
 ///
 /// ```swift
 /// await withDiscardingTaskGroup { group in
+///   let pickFirst = PickFirstLoadBalancer(
+///     // ... other parameters ...
+///   ) { event, loadBalancerID in
+///     switch event {
+///     case .connectivityStateChanged(.ready):
+///       // ...
+///     default:
+///       // ...
+///     }
+///   }
+///
 ///   // Run the load-balancer
 ///   group.addTask { await pickFirst.run() }
 ///
@@ -44,16 +55,6 @@ private import Synchronization
 ///     ]
 ///   )
 ///   pickFirst.updateEndpoint(endpoint)
-///
-///   // Consume state update events
-///   for await event in pickFirst.events {
-///     switch event {
-///     case .connectivityStateChanged(.ready):
-///       // ...
-///     default:
-///       // ...
-///     }
-///   }
 /// }
 /// ```
 @available(gRPCSwiftNIOTransport 2.0, *)
@@ -66,11 +67,7 @@ package final class PickFirstLoadBalancer: Sendable {
   }
 
   /// Events which can happen to the load balancer.
-  private let event:
-    (
-      stream: AsyncStream<LoadBalancerEvent>,
-      continuation: AsyncStream<LoadBalancerEvent>.Continuation
-    )
+  private let eventListener: @Sendable (_ event: LoadBalancerEvent?, _ id: LoadBalancerID) -> Void
 
   /// Inputs which this load balancer should react to.
   private let input: (stream: AsyncStream<Input>, continuation: AsyncStream<Input>.Continuation)
@@ -102,7 +99,8 @@ package final class PickFirstLoadBalancer: Sendable {
     authority: String?,
     backoff: Backoff,
     defaultCompression: CompressionAlgorithm,
-    enabledCompression: CompressionAlgorithmSet
+    enabledCompression: CompressionAlgorithmSet,
+    eventListener: @Sendable @escaping (_ event: LoadBalancerEvent?, _ id: LoadBalancerID) -> Void
   ) {
     self.connector = connector
     self.authority = authority
@@ -112,21 +110,17 @@ package final class PickFirstLoadBalancer: Sendable {
     self.id = LoadBalancerID()
     self.state = Mutex(State())
 
-    self.event = AsyncStream.makeStream(of: LoadBalancerEvent.self)
+    self.eventListener = eventListener
     self.input = AsyncStream.makeStream(of: Input.self)
-    // The load balancer starts in the idle state.
-    self.event.continuation.yield(.connectivityStateChanged(.idle))
-  }
-
-  /// A stream of events which can happen to the load balancer.
-  package var events: AsyncStream<LoadBalancerEvent> {
-    self.event.stream
   }
 
   /// Runs the load balancer, returning when it has closed.
   ///
-  /// You can monitor events which happen on the load balancer with ``events``.
+  /// Events are delivered to the event listener callback provided during initialization.
   package func run() async {
+    // The load balancer starts in the idle state.
+    self.eventListener(.connectivityStateChanged(.idle), self.id)
+
     await withDiscardingTaskGroup { group in
       for await input in self.input.stream {
         switch input {
@@ -140,7 +134,7 @@ package final class PickFirstLoadBalancer: Sendable {
 
     if Task.isCancelled {
       // Finish the event stream as it's unlikely to have been finished by a regular code path.
-      self.event.continuation.finish()
+      self.eventListener(nil, self.id)
     }
   }
 
@@ -185,7 +179,8 @@ extension PickFirstLoadBalancer {
           authority: self.authority,
           backoff: self.backoff,
           defaultCompression: self.defaultCompression,
-          enabledCompression: self.enabledCompression
+          enabledCompression: self.enabledCompression,
+          eventListener: { self.handleSubchannelEvent($0, subchannelID: $1) }
         )
       }
     }
@@ -200,6 +195,19 @@ extension PickFirstLoadBalancer {
     }
   }
 
+  private func handleSubchannelEvent(_ event: Subchannel.Event?, subchannelID: SubchannelID) {
+    switch event {
+    case .connectivityStateChanged(let connectivityState):
+      self.handleSubchannelConnectivityStateChange(connectivityState, id: subchannelID)
+    case .goingAway:
+      self.handleGoAway(id: subchannelID)
+    case .requiresNameResolution:
+      self.eventListener(.requiresNameResolution, self.id)
+    case nil:
+      ()
+    }
+  }
+
   private func runSubchannel(
     _ subchannel: Subchannel,
     in group: inout DiscardingTaskGroup
@@ -208,19 +216,6 @@ extension PickFirstLoadBalancer {
     subchannel.connect()
     group.addTask {
       await subchannel.run()
-    }
-
-    group.addTask {
-      for await event in subchannel.events {
-        switch event {
-        case .connectivityStateChanged(let state):
-          self.handleSubchannelConnectivityStateChange(state, id: subchannel.id)
-        case .goingAway:
-          self.handleGoAway(id: subchannel.id)
-        case .requiresNameResolution:
-          self.event.continuation.yield(.requiresNameResolution)
-        }
-      }
     }
   }
 
@@ -237,11 +232,11 @@ extension PickFirstLoadBalancer {
       subchannel.shutDown()
     case .closeAndPublishStateChange(let subchannel, let connectivityState):
       subchannel.shutDown()
-      self.event.continuation.yield(.connectivityStateChanged(connectivityState))
+      self.eventListener(.connectivityStateChanged(connectivityState), self.id)
     case .publishStateChange(let connectivityState):
-      self.event.continuation.yield(.connectivityStateChanged(connectivityState))
+      self.eventListener(.connectivityStateChanged(connectivityState), self.id)
     case .closed:
-      self.event.continuation.finish()
+      self.eventListener(nil, self.id)
       self.input.continuation.finish()
     case .none:
       ()
@@ -258,13 +253,13 @@ extension PickFirstLoadBalancer {
     let onClose = self.state.withLock { $0.close() }
     switch onClose {
     case .closeSubchannels(let subchannel1, let subchannel2):
-      self.event.continuation.yield(.connectivityStateChanged(.shutdown))
+      self.eventListener(.connectivityStateChanged(.shutdown), self.id)
       subchannel1.shutDown()
       subchannel2?.shutDown()
 
     case .closed:
-      self.event.continuation.yield(.connectivityStateChanged(.shutdown))
-      self.event.continuation.finish()
+      self.eventListener(.connectivityStateChanged(.shutdown), self.id)
+      self.eventListener(nil, self.id)
       self.input.continuation.finish()
 
     case .none:

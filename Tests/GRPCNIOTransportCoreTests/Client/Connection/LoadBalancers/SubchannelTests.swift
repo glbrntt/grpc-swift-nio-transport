@@ -24,7 +24,7 @@ import XCTest
 @available(gRPCSwiftNIOTransport 2.0, *)
 final class SubchannelTests: XCTestCase {
   func testMakeStreamOnIdleSubchannel() async throws {
-    let subchannel = self.makeSubchannel(
+    let (subchannel, _) = self.makeSubchannel(
       address: .unixDomainSocket(path: "ignored"),
       connector: .never
     )
@@ -39,7 +39,7 @@ final class SubchannelTests: XCTestCase {
   }
 
   func testMakeStreamOnShutdownSubchannel() async throws {
-    let subchannel = self.makeSubchannel(
+    let (subchannel, _) = self.makeSubchannel(
       address: .unixDomainSocket(path: "ignored"),
       connector: .never
     )
@@ -57,7 +57,7 @@ final class SubchannelTests: XCTestCase {
   func testMakeStreamOnReadySubchannel() async throws {
     let server = TestServer(eventLoopGroup: .singletonMultiThreadedEventLoopGroup)
     let address = try await server.bind()
-    let subchannel = self.makeSubchannel(address: address, connector: .posix())
+    let (subchannel, events) = self.makeSubchannel(address: address, connector: .posix())
 
     try await withThrowingTaskGroup(of: Void.self) { group in
       group.addTask {
@@ -80,7 +80,7 @@ final class SubchannelTests: XCTestCase {
 
       subchannel.connect()
 
-      for await event in subchannel.events {
+      for await event in events {
         switch event {
         case .connectivityStateChanged(.ready):
           let stream = try await subchannel.makeStream(descriptor: .echoGet, options: .defaults)
@@ -114,7 +114,7 @@ final class SubchannelTests: XCTestCase {
 
   func testConnectEventuallySucceeds() async throws {
     let path = "test-connect-eventually-succeeds"
-    let subchannel = self.makeSubchannel(
+    let (subchannel, eventStream) = self.makeSubchannel(
       address: .unixDomainSocket(path: path),
       connector: .posix(),
       backoff: .fixed(at: .milliseconds(10))
@@ -126,7 +126,7 @@ final class SubchannelTests: XCTestCase {
       var hasServer = false
       var events = [Subchannel.Event]()
 
-      for await event in subchannel.events {
+      for await event in eventStream {
         events.append(event)
         switch event {
         case .connectivityStateChanged(.idle):
@@ -191,7 +191,7 @@ final class SubchannelTests: XCTestCase {
   func testConnectIteratesThroughAddresses() async throws {
     let server = TestServer(eventLoopGroup: .singletonMultiThreadedEventLoopGroup)
     let address = try await server.bind()
-    let subchannel = self.makeSubchannel(
+    let (subchannel, events) = self.makeSubchannel(
       addresses: [
         .unixDomainSocket(path: "not-listening-1"),
         .unixDomainSocket(path: "not-listening-2"),
@@ -211,7 +211,7 @@ final class SubchannelTests: XCTestCase {
         await subchannel.run()
       }
 
-      for await event in subchannel.events {
+      for await event in events {
         switch event {
         case .connectivityStateChanged(.idle):
           subchannel.connect()
@@ -230,7 +230,7 @@ final class SubchannelTests: XCTestCase {
     let server = TestServer(eventLoopGroup: .singletonMultiThreadedEventLoopGroup)
     let udsPath = "test-wrap-around-addrs"
 
-    let subchannel = self.makeSubchannel(
+    let (subchannel, events) = self.makeSubchannel(
       addresses: [
         .unixDomainSocket(path: "not-listening-1"),
         .unixDomainSocket(path: "not-listening-2"),
@@ -247,7 +247,7 @@ final class SubchannelTests: XCTestCase {
 
       var isServerRunning = false
 
-      for await event in subchannel.events {
+      for await event in events {
         switch event {
         case .connectivityStateChanged(.idle):
           subchannel.connect()
@@ -282,7 +282,7 @@ final class SubchannelTests: XCTestCase {
   func testIdleTimeout() async throws {
     let server = TestServer(eventLoopGroup: .singletonMultiThreadedEventLoopGroup)
     let address = try await server.bind()
-    let subchannel = self.makeSubchannel(
+    let (subchannel, eventStream) = self.makeSubchannel(
       address: address,
       connector: .posix(maxIdleTime: .milliseconds(1))  // Aggressively idle
     )
@@ -300,7 +300,7 @@ final class SubchannelTests: XCTestCase {
 
       var idleCount = 0
       var events = [Subchannel.Event]()
-      for await event in subchannel.events {
+      for await event in eventStream {
         events.append(event)
         switch event {
         case .connectivityStateChanged(.idle):
@@ -334,7 +334,7 @@ final class SubchannelTests: XCTestCase {
   func testConnectionDropWhenIdle() async throws {
     let server = TestServer(eventLoopGroup: .singletonMultiThreadedEventLoopGroup)
     let address = try await server.bind()
-    let subchannel = self.makeSubchannel(address: address, connector: .posix())
+    let (subchannel, eventStream) = self.makeSubchannel(address: address, connector: .posix())
 
     await withThrowingTaskGroup(of: Void.self) { group in
       group.addTask {
@@ -350,7 +350,7 @@ final class SubchannelTests: XCTestCase {
       var events = [Subchannel.Event]()
       var idleCount = 0
 
-      for await event in subchannel.events {
+      for await event in eventStream {
         events.append(event)
 
         switch event {
@@ -392,7 +392,7 @@ final class SubchannelTests: XCTestCase {
   func testConnectionDropWithOpenStreams() async throws {
     let server = TestServer(eventLoopGroup: .singletonMultiThreadedEventLoopGroup)
     let address = try await server.bind()
-    let subchannel = self.makeSubchannel(address: address, connector: .posix())
+    let (subchannel, eventStream) = self.makeSubchannel(address: address, connector: .posix())
 
     try await withThrowingTaskGroup(of: Void.self) { group in
       group.addTask {
@@ -406,7 +406,7 @@ final class SubchannelTests: XCTestCase {
       var events = [Subchannel.Event]()
       var readyCount = 0
 
-      for await event in subchannel.events {
+      for await event in eventStream {
         events.append(event)
         switch event {
         case .connectivityStateChanged(.idle):
@@ -470,7 +470,7 @@ final class SubchannelTests: XCTestCase {
   func testConnectedReceivesGoAway() async throws {
     let server = TestServer(eventLoopGroup: .singletonMultiThreadedEventLoopGroup)
     let address = try await server.bind()
-    let subchannel = self.makeSubchannel(address: address, connector: .posix())
+    let (subchannel, eventStream) = self.makeSubchannel(address: address, connector: .posix())
 
     try await withThrowingTaskGroup(of: Void.self) { group in
       group.addTask {
@@ -486,7 +486,7 @@ final class SubchannelTests: XCTestCase {
       var events = [Subchannel.Event]()
 
       var idleCount = 0
-      for await event in subchannel.events {
+      for await event in eventStream {
         events.append(event)
 
         switch event {
@@ -535,7 +535,7 @@ final class SubchannelTests: XCTestCase {
   func testCancelReadySubchannel() async throws {
     let server = TestServer(eventLoopGroup: .singletonMultiThreadedEventLoopGroup)
     let address = try await server.bind()
-    let subchannel = self.makeSubchannel(address: address, connector: .posix())
+    let (subchannel, eventStream) = self.makeSubchannel(address: address, connector: .posix())
 
     await withThrowingTaskGroup(of: Void.self) { group in
       group.addTask {
@@ -549,7 +549,7 @@ final class SubchannelTests: XCTestCase {
         await subchannel.run()
       }
 
-      for await event in subchannel.events {
+      for await event in eventStream {
         switch event {
         case .connectivityStateChanged(.ready):
           group.cancelAll()
@@ -564,8 +564,9 @@ final class SubchannelTests: XCTestCase {
     addresses: [GRPCNIOTransportCore.SocketAddress],
     connector: any HTTP2Connector,
     backoff: Backoff? = nil
-  ) -> Subchannel {
-    return Subchannel(
+  ) -> (Subchannel, AsyncStream<Subchannel.Event>) {
+    let events = AsyncStream.makeStream(of: Subchannel.Event.self)
+    let subchannel = Subchannel(
       endpoint: Endpoint(addresses: addresses),
       id: SubchannelID(),
       connector: connector,
@@ -573,14 +574,22 @@ final class SubchannelTests: XCTestCase {
       backoff: backoff ?? .defaults,
       defaultCompression: .none,
       enabledCompression: .none
-    )
+    ) { event, _ in
+      if let event = event {
+        events.continuation.yield(event)
+      } else {
+        events.continuation.finish()
+      }
+    }
+
+    return (subchannel, events.stream)
   }
 
   private func makeSubchannel(
     address: GRPCNIOTransportCore.SocketAddress,
     connector: any HTTP2Connector,
     backoff: Backoff? = nil
-  ) -> Subchannel {
+  ) -> (Subchannel, AsyncStream<Subchannel.Event>) {
     self.makeSubchannel(addresses: [address], connector: connector, backoff: backoff)
   }
 }

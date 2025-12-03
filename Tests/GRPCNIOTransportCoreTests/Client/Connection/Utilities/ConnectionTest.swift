@@ -40,6 +40,8 @@ enum ConnectionTest {
     let server = Server(mode: mode)
     let address = try await server.bind()
 
+    let eventStream = AsyncStream.makeStream(of: Connection.Event.self)
+
     try await withThrowingTaskGroup(of: Void.self) { group in
       let connection = Connection(
         address: address,
@@ -47,12 +49,18 @@ enum ConnectionTest {
         http2Connector: connector,
         defaultCompression: .none,
         enabledCompression: .none
-      )
+      ) { event in
+        if let event = event {
+          eventStream.continuation.yield(event)
+        } else {
+          eventStream.continuation.finish()
+        }
+      }
       let context = Context(server: server, connection: connection)
       group.addTask { await connection.run() }
 
       var events: [Connection.Event] = []
-      for await event in connection.events {
+      for await event in eventStream.stream {
         events.append(event)
         try await handlEvents(context, event)
       }

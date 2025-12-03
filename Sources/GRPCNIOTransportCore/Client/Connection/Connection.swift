@@ -26,21 +26,24 @@ private import Synchronization
 /// must be created. However, an active connection may be used multiple times to provide streams
 /// to the backend.
 ///
-/// To use the `Connection` you must run it in a task. You can consume event updates by listening
-/// to `events`:
+/// To use the `Connection` you must run it in a task and provide an event listener callback
+/// to handle connection events:
 ///
 /// ```swift
 /// await withTaskGroup(of: Void.self) { group in
-///   group.addTask { await connection.run() }
-///
-///   for await event in connection.events {
+///   let connection = Connection(
+///     // ... other parameters ...
+///   ) { event in
 ///     switch event {
 ///     case .connectSucceeded:
+///       // ...
+///     case .connectFailed(let error):
 ///       // ...
 ///     default:
 ///       // ...
 ///     }
 ///   }
+///   group.addTask { await connection.run() }
 /// }
 /// ```
 @available(gRPCSwiftNIOTransport 2.0, *)
@@ -77,8 +80,12 @@ package final class Connection: Sendable {
     case close
   }
 
-  /// Events which have happened to the connection.
-  private let event: (stream: AsyncStream<Event>, continuation: AsyncStream<Event>.Continuation)
+  /// A callback to notify a parent object of various state change events.
+  ///
+  /// Previously this was as async stream of events consumed by a parent object. However,
+  /// this introduced timing windows between publishing the event and it being consumed which
+  /// introduces errors further up the stack.
+  private let eventListener: @Sendable (_ event: Event?) -> Void
 
   /// Events which the connection must react to.
   private let input: (stream: AsyncStream<Input>, continuation: AsyncStream<Input>.Continuation)
@@ -110,11 +117,6 @@ package final class Connection: Sendable {
     4 * 1024 * 1024
   }
 
-  /// A stream of events which can happen to the connection.
-  package var events: AsyncStream<Event> {
-    self.event.stream
-  }
-
   private static func sanitizeAuthorityForSNI(_ authority: String) -> String {
     // Strip off a trailing ":{PORT}". Look for the last non-digit byte, if it's
     // a colon then keep everything up to that index.
@@ -134,7 +136,8 @@ package final class Connection: Sendable {
     authority: String?,
     http2Connector: any HTTP2Connector,
     defaultCompression: CompressionAlgorithm,
-    enabledCompression: CompressionAlgorithmSet
+    enabledCompression: CompressionAlgorithmSet,
+    eventListener: @Sendable @escaping (_ event: Event?) -> Void
   ) {
     self.address = address
     self.authority = authority
@@ -142,15 +145,15 @@ package final class Connection: Sendable {
     self.defaultCompression = defaultCompression
     self.enabledCompression = enabledCompression
     self.http2Connector = http2Connector
-    self.event = AsyncStream.makeStream(of: Event.self)
+    self.eventListener = eventListener
     self.input = AsyncStream.makeStream(of: Input.self)
     self.state = Mutex(.notConnected)
   }
 
   /// Connect and run the connection.
   ///
-  /// This function returns when the connection has closed. You can observe connection events
-  /// by consuming the ``events`` sequence.
+  /// This function returns when the connection has closed. Connection events are delivered
+  /// to the event listener callback provided during initialization.
   package func run() async {
     func establishConnectionOrThrow() async throws(RPCError) -> HTTP2Connection {
       do {
@@ -307,7 +310,7 @@ package final class Connection: Sendable {
         switch connectionEvent {
         case .ready:
           isReady = true
-          self.event.continuation.yield(.connectSucceeded)
+          self.eventListener(.connectSucceeded)
 
         case .closing(let reason):
           self.state.withLock { $0.closing() }
@@ -316,7 +319,7 @@ package final class Connection: Sendable {
           case .goAway(let errorCode, let reason):
             // The connection will close at some point soon, yield a notification for this
             // because the close might not be imminent and this could result in address resolution.
-            self.event.continuation.yield(.goingAway(errorCode, reason))
+            self.eventListener(.goingAway(errorCode, reason))
           case .idle, .keepaliveExpired, .initiatedLocally:
             // The connection will be closed imminently in these cases there's no need to do
             // anything.
@@ -400,8 +403,8 @@ package final class Connection: Sendable {
   }
 
   private func finishStreams(withEvent event: Event) {
-    self.event.continuation.yield(event)
-    self.event.continuation.finish()
+    self.eventListener(event)
+    self.eventListener(nil)
     self.input.continuation.finish()
   }
 }

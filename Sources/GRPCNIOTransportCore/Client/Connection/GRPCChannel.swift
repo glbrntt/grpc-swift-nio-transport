@@ -27,8 +27,8 @@ package final class GRPCChannel: ClientTransport {
     case close
     /// Handle the result of a name resolution.
     case handleResolutionResult(NameResolutionResult)
-    /// Handle the event from the underlying connection object.
-    case handleLoadBalancerEvent(LoadBalancerEvent, LoadBalancerID)
+    /// Run a resolve.
+    case resolve
   }
 
   /// Events which can happen to the channel.
@@ -198,7 +198,7 @@ package final class GRPCChannel: ClientTransport {
           resolver: self.resolver.names,
           backoff: self.resolverBackoff
         )
-        await self.resolve(using: &resolver, handlingResultIn: &group)
+        await self.resolve(using: &resolver)
         resolverWithBackoff = resolver
       }
 
@@ -208,16 +208,11 @@ package final class GRPCChannel: ClientTransport {
         case .close:
           self.handleClose(in: &group)
 
+        case .resolve:
+          await self.resolve(using: &resolverWithBackoff)
+
         case .handleResolutionResult(let result):
           self.handleNameResolutionResult(result, in: &group)
-
-        case .handleLoadBalancerEvent(let event, let id):
-          await self.handleLoadBalancerEvent(
-            event,
-            loadBalancerID: id,
-            in: &group,
-            resolver: &resolverWithBackoff
-          )
         }
       }
     }
@@ -525,7 +520,8 @@ extension GRPCChannel {
             authority: self.authority,
             backoff: self.backoff,
             defaultCompression: self.defaultCompression,
-            enabledCompression: self.enabledCompression
+            enabledCompression: self.enabledCompression,
+            eventListener: { self.handleLoadBalancerEvent($0, loadBalancerID: $1)}
           )
           return .roundRobin(loadBalancer)
         }
@@ -543,7 +539,8 @@ extension GRPCChannel {
             authority: self.authority,
             backoff: self.backoff,
             defaultCompression: self.defaultCompression,
-            enabledCompression: self.enabledCompression
+            enabledCompression: self.enabledCompression,
+            eventListener: { self.handleLoadBalancerEvent($0, loadBalancerID: $1) }
           )
           return .pickFirst(loadBalancer)
         }
@@ -574,12 +571,6 @@ extension GRPCChannel {
         await new.run()
       }
 
-      group.addTask {
-        for await event in new.events {
-          self.input.continuation.yield(.handleLoadBalancerEvent(event, new.id))
-        }
-      }
-
     case .updateLoadBalancer(let existing):
       switch existing {
       case .roundRobin(let loadBalancer):
@@ -594,11 +585,9 @@ extension GRPCChannel {
   }
 
   private func handleLoadBalancerEvent(
-    _ event: LoadBalancerEvent,
-    loadBalancerID: LoadBalancerID,
-    in group: inout DiscardingTaskGroup,
-    resolver: inout ResolverWithBackoff?
-  ) async {
+    _ event: LoadBalancerEvent?,
+    loadBalancerID: LoadBalancerID
+  ) {
     switch event {
     case .connectivityStateChanged(let connectivityState):
       let actions = self.state.withLock { state in
@@ -626,35 +615,18 @@ extension GRPCChannel {
       }
 
     case .requiresNameResolution:
-      await self.resolve(using: &resolver, handlingResultIn: &group)
+      self.input.continuation.yield(.resolve)
+
+    case .none:
+      ()
     }
   }
 
-  private func resolve(
-    iterator: inout RPCAsyncSequence<NameResolutionResult, any Error>.AsyncIterator?,
-    in group: inout DiscardingTaskGroup
-  ) async {
-    guard var iterator = iterator else { return }
-
-    do {
-      if let result = try await iterator.next() {
-        self.handleNameResolutionResult(result, in: &group)
-      } else {
-        self.beginGracefulShutdown()
-      }
-    } catch {
-      self.beginGracefulShutdown()
-    }
-  }
-
-  private func resolve(
-    using resolver: inout ResolverWithBackoff?,
-    handlingResultIn group: inout DiscardingTaskGroup
-  ) async {
+  private func resolve(using resolver: inout ResolverWithBackoff?) async {
     loop: while !Task.isCancelled {
       switch await resolver?.resolve() {
       case .resolved(let result):
-        self.handleNameResolutionResult(result, in: &group)
+        self.input.continuation.yield(.handleResolutionResult(result))
         break loop
 
       case .backoff(let duration, let error):

@@ -44,9 +44,9 @@ package struct SubchannelID: Hashable, Sendable, CustomStringConvertible {
 
 /// A process-unique ID for a load-balancer.
 @available(gRPCSwiftNIOTransport 2.0, *)
-struct LoadBalancerID: Hashable, Sendable, CustomStringConvertible {
+package struct LoadBalancerID: Hashable, Sendable, CustomStringConvertible {
   private let id = ProcessUniqueID()
-  var description: String {
+  package var description: String {
     "lb_\(self.id)"
   }
 }

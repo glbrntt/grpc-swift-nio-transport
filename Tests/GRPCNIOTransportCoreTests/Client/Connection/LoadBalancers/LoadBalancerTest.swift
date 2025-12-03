@@ -17,6 +17,7 @@
 import GRPCCore
 import GRPCNIOTransportCore
 import NIOPosix
+import Synchronization
 import XCTest
 
 @available(gRPCSwiftNIOTransport 2.0, *)
@@ -47,7 +48,8 @@ enum LoadBalancerTest {
         authority: nil,
         backoff: backoff,
         defaultCompression: .none,
-        enabledCompression: .none
+        enabledCompression: .none,
+        eventListener: $0
       )
       return .pickFirst(pickFirst)
     }
@@ -74,7 +76,8 @@ enum LoadBalancerTest {
         authority: nil,
         backoff: backoff,
         defaultCompression: .none,
-        enabledCompression: .none
+        enabledCompression: .none,
+        eventListener: $0
       )
       return .roundRobin(roundRobin)
     }
@@ -86,7 +89,9 @@ enum LoadBalancerTest {
     function: String,
     handleEvent: @escaping @Sendable (Context, LoadBalancerEvent) async throws -> Void,
     verifyEvents: @escaping @Sendable ([LoadBalancerEvent]) -> Void = { _ in },
-    makeLoadBalancer: @escaping @Sendable () -> LoadBalancer
+    makeLoadBalancer: @escaping @Sendable (
+      _ eventListener: @escaping @Sendable (LoadBalancerEvent?, LoadBalancerID) -> Void
+    ) -> LoadBalancer
   ) async throws {
     enum TestEvent {
       case timedOut
@@ -129,7 +134,9 @@ enum LoadBalancerTest {
     servers serverCount: Int,
     handleEvent: @escaping @Sendable (Context, LoadBalancerEvent) async throws -> Void,
     verifyEvents: @escaping @Sendable ([LoadBalancerEvent]) -> Void,
-    makeLoadBalancer: @escaping @Sendable () -> LoadBalancer
+    makeLoadBalancer: @escaping @Sendable (
+      _ eventListener: @escaping @Sendable (LoadBalancerEvent?, LoadBalancerID) -> Void
+    ) -> LoadBalancer
   ) async throws {
     try await withThrowingTaskGroup(of: Void.self) { group in
       // Create the test servers.
@@ -147,7 +154,15 @@ enum LoadBalancerTest {
       }
 
       // Create the load balancer.
-      let loadBalancer = makeLoadBalancer()
+      let eventStream = AsyncStream.makeStream(of: LoadBalancerEvent.self)
+
+      let loadBalancer = makeLoadBalancer { event, _ in
+        if let event = event {
+          eventStream.continuation.yield(event)
+        } else {
+          eventStream.continuation.finish()
+        }
+      }
 
       group.addTask {
         await loadBalancer.run()
@@ -156,7 +171,7 @@ enum LoadBalancerTest {
       let context = Context(servers: servers, loadBalancer: loadBalancer)
 
       var events = [LoadBalancerEvent]()
-      for await event in loadBalancer.events {
+      for await event in eventStream.stream {
         events.append(event)
         try await handleEvent(context, event)
       }

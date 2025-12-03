@@ -193,7 +193,7 @@ final class ConnectionTests: XCTestCase {
       http2Connector: .never,
       defaultCompression: .none,
       enabledCompression: .none
-    )
+    ) { _ in }
 
     await XCTAssertThrowsErrorAsync(ofType: RPCError.self) {
       _ = try await connection.makeStream(descriptor: .echoGet, options: .defaults)
@@ -210,7 +210,7 @@ final class ConnectionTests: XCTestCase {
       http2Connector: recorder,
       defaultCompression: .none,
       enabledCompression: .none
-    )
+    ) { _ in }
 
     // The connect attempt will fail, but as a side effect the SNI hostname
     // will be recorded.

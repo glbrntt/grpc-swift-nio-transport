@@ -26,16 +26,27 @@ private import NIOConcurrencyHelpers
 /// subchannels will be removed if their addresses are no longer present.
 ///
 /// The state of the load-balancer is aggregated across the state of its subchannels, changes in
-/// the aggregate state are reported up via ``events``.
+/// the aggregate state are reported via the event listener callback.
 ///
 /// You must call ``close()`` on the load-balancer when it's no longer required. This will move
 /// it to the ``ConnectivityState/shutdown`` state: existing RPCs may continue but all subsequent
 /// calls to ``makeStream(descriptor:options:)`` will fail.
 ///
-/// To use this load-balancer you must run it in a task:
+/// To use this load-balancer you must run it in a task and provide an event listener callback:
 ///
 /// ```swift
 /// await withDiscardingTaskGroup { group in
+///   let roundRobin = RoundRobinLoadBalancer(
+///     // ... other parameters ...
+///   ) { event, loadBalancerID in
+///     switch event {
+///     case .connectivityStateChanged(.ready):
+///       // ...
+///     default:
+///       // ...
+///     }
+///   }
+///
 ///   // Run the load-balancer
 ///   group.addTask { await roundRobin.run() }
 ///
@@ -46,16 +57,6 @@ private import NIOConcurrencyHelpers
 ///     Endpoint(addresses: [.ipv4(host: "127.0.0.1", port: 1003)])
 ///   ]
 ///   roundRobin.updateAddresses(endpoints)
-///
-///   // Consume state update events
-///   for await event in roundRobin.events {
-///     switch event {
-///     case .connectivityStateChanged(.ready):
-///       // ...
-///     default:
-///       // ...
-///     }
-///   }
 /// }
 /// ```
 @available(gRPCSwiftNIOTransport 2.0, *)
@@ -93,12 +94,7 @@ package final class RoundRobinLoadBalancer: Sendable {
     }
   }
 
-  /// Events which can happen to the load balancer.
-  private let event:
-    (
-      stream: AsyncStream<LoadBalancerEvent>,
-      continuation: AsyncStream<LoadBalancerEvent>.Continuation
-    )
+  private let eventListener: @Sendable (_ event: LoadBalancerEvent?, _ id: LoadBalancerID) -> Void
 
   /// Inputs which this load balancer should react to.
   private let input: (stream: AsyncStream<Input>, continuation: AsyncStream<Input>.Continuation)
@@ -131,7 +127,8 @@ package final class RoundRobinLoadBalancer: Sendable {
     authority: String?,
     backoff: Backoff,
     defaultCompression: CompressionAlgorithm,
-    enabledCompression: CompressionAlgorithmSet
+    enabledCompression: CompressionAlgorithmSet,
+    eventListener: @Sendable @escaping (_ event: LoadBalancerEvent?, _ id: LoadBalancerID) -> Void
   ) {
     self.connector = connector
     self.authority = authority
@@ -140,23 +137,18 @@ package final class RoundRobinLoadBalancer: Sendable {
     self.enabledCompression = enabledCompression
     self.id = LoadBalancerID()
 
-    self.event = AsyncStream.makeStream(of: LoadBalancerEvent.self)
+    self.eventListener = eventListener
     self.input = AsyncStream.makeStream(of: Input.self)
     self.state = NIOLockedValueBox(.active(State.Active()))
-
-    // The load balancer starts in the idle state.
-    self.event.continuation.yield(.connectivityStateChanged(.idle))
-  }
-
-  /// A stream of events which can happen to the load balancer.
-  package var events: AsyncStream<LoadBalancerEvent> {
-    self.event.stream
   }
 
   /// Runs the load balancer, returning when it has closed.
   ///
-  /// You can monitor events which happen on the load balancer with ``events``.
+  /// Events are delivered to the event listener callback provided during initialization.
   package func run() async {
+    // The load balancer starts in the idle state.
+    self.eventListener(.connectivityStateChanged(.idle), self.id)
+
     await withDiscardingTaskGroup { group in
       for await input in self.input.stream {
         switch input {
@@ -170,7 +162,7 @@ package final class RoundRobinLoadBalancer: Sendable {
 
     if Task.isCancelled {
       // Finish the event stream as it's unlikely to have been finished by a regular code path.
-      self.event.continuation.finish()
+      self.eventListener(nil, self.id)
     }
   }
 
@@ -234,14 +226,15 @@ extension RoundRobinLoadBalancer {
           authority: self.authority,
           backoff: self.backoff,
           defaultCompression: self.defaultCompression,
-          enabledCompression: self.enabledCompression
+          enabledCompression: self.enabledCompression,
+          eventListener: { self.handleSubchannelEvent($0, key: EndpointKey(endpoint), id: $1) }
         )
       }
     }
 
     // Publish the new connectivity state.
     if let newState = newState {
-      self.event.continuation.yield(.connectivityStateChanged(newState))
+      self.eventListener(.connectivityStateChanged(newState), self.id)
     }
 
     // Run each of the new subchannels.
@@ -258,6 +251,19 @@ extension RoundRobinLoadBalancer {
     }
   }
 
+  private func handleSubchannelEvent(_ event: Subchannel.Event?, key: EndpointKey, id: SubchannelID) {
+    switch event {
+    case .connectivityStateChanged(let connectivityState):
+      self.handleSubchannelConnectivityStateChange(connectivityState, key: key)
+    case .goingAway:
+      self.handleSubchannelGoingAway(key: key)
+    case .requiresNameResolution:
+      self.eventListener(.requiresNameResolution, self.id)
+    case nil:
+      ()
+    }
+  }
+
   private func runSubchannel(
     _ subchannel: Subchannel,
     forKey key: EndpointKey,
@@ -267,19 +273,6 @@ extension RoundRobinLoadBalancer {
     subchannel.connect()
     group.addTask {
       await subchannel.run()
-    }
-
-    group.addTask {
-      for await event in subchannel.events {
-        switch event {
-        case .connectivityStateChanged(let state):
-          self.handleSubchannelConnectivityStateChange(state, key: key)
-        case .goingAway:
-          self.handleSubchannelGoingAway(key: key)
-        case .requiresNameResolution:
-          self.event.continuation.yield(.requiresNameResolution)
-        }
-      }
     }
   }
 
@@ -293,10 +286,10 @@ extension RoundRobinLoadBalancer {
 
     switch onChange {
     case .publishStateChange(let aggregateState):
-      self.event.continuation.yield(.connectivityStateChanged(aggregateState))
+      self.eventListener(.connectivityStateChanged(aggregateState), self.id)
 
     case .closeAndPublishStateChange(let subchannel, let aggregateState):
-      self.event.continuation.yield(.connectivityStateChanged(aggregateState))
+      self.eventListener(.connectivityStateChanged(aggregateState), self.id)
       subchannel.shutDown()
 
     case .close(let subchannel):
@@ -304,7 +297,7 @@ extension RoundRobinLoadBalancer {
 
     case .closed:
       // All subchannels are closed; finish the streams so the run loop exits.
-      self.event.continuation.finish()
+      self.eventListener(nil, self.id)
       self.input.continuation.finish()
 
     case .none:
@@ -317,7 +310,7 @@ extension RoundRobinLoadBalancer {
     case .closeAndUpdateState(let subchannel, let connectivityState):
       subchannel.shutDown()
       if let connectivityState = connectivityState {
-        self.event.continuation.yield(.connectivityStateChanged(connectivityState))
+        self.eventListener(.connectivityStateChanged(connectivityState), self.id)
       }
     case .none:
       ()
@@ -328,7 +321,7 @@ extension RoundRobinLoadBalancer {
     switch self.state.withLockedValue({ $0.close() }) {
     case .closeSubchannels(let subchannels):
       // Publish a new shutdown state, this LB is no longer usable for new RPCs.
-      self.event.continuation.yield(.connectivityStateChanged(.shutdown))
+      self.eventListener(.connectivityStateChanged(.shutdown), self.id)
 
       // Close the subchannels.
       for subchannel in subchannels {
@@ -337,8 +330,8 @@ extension RoundRobinLoadBalancer {
 
     case .closed:
       // No subchannels to close.
-      self.event.continuation.yield(.connectivityStateChanged(.shutdown))
-      self.event.continuation.finish()
+      self.eventListener(.connectivityStateChanged(.shutdown), self.id)
+      self.eventListener(nil, self.id)
       self.input.continuation.finish()
 
     case .none:
