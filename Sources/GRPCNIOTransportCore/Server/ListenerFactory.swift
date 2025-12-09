@@ -20,15 +20,17 @@ package import NIOExtras
 /// A factory to produce `NIOAsyncChannel`s to listen for new HTTP/2 connections.
 ///
 /// - SeeAlso: ``CommonHTTP2ServerTransport``
-@available(gRPCSwiftNIOTransport 2.0, *)
-package protocol HTTP2ListenerFactory: Sendable {
-  typealias AcceptedChannel = (
-    ChannelPipeline.SynchronousOperations.HTTP2ConnectionChannel,
-    ChannelPipeline.SynchronousOperations.HTTP2StreamMultiplexer
-  )
+@available(gRPCSwiftNIOTransport 2.5, *)
+extension HTTP2ServerTransport {
+  package protocol ListenerFactory: Sendable {
+    typealias AcceptedChannel = (
+      ChannelPipeline.SynchronousOperations.HTTP2ConnectionChannel,
+      ChannelPipeline.SynchronousOperations.HTTP2StreamMultiplexer
+    )
 
-  func makeListeningChannel(
-    eventLoopGroup: any EventLoopGroup,
-    serverQuiescingHelper: ServerQuiescingHelper
-  ) async throws -> NIOAsyncChannel<AcceptedChannel, Never>
+    func makeListeningChannel(
+      eventLoopGroup: any EventLoopGroup,
+      serverQuiescingHelper: ServerQuiescingHelper
+    ) async throws -> NIOAsyncChannel<AcceptedChannel, Never>
+  }
 }
