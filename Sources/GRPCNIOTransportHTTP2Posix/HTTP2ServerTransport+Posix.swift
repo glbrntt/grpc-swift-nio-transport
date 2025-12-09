@@ -57,13 +57,27 @@ extension HTTP2ServerTransport {
   public struct Posix: ServerTransport, ListeningServerTransport {
     public typealias Bytes = GRPCNIOTransportBytes
 
-    private struct ListenerFactory: HTTP2ListenerFactory {
+    struct ListenerFactory: HTTP2ListenerFactory {
+      let address: Address
       let config: Config
       let transportSecurity: TransportSecurity
 
+      enum Address {
+        case socketAddress(GRPCNIOTransportCore.SocketAddress)
+        case listeningSocket(Int)
+
+        var socketAddress: GRPCNIOTransportCore.SocketAddress? {
+          switch self {
+          case .socketAddress(let address):
+            return address
+          case .listeningSocket:
+            return nil
+          }
+        }
+      }
+
       func makeListeningChannel(
         eventLoopGroup: any EventLoopGroup,
-        address: GRPCNIOTransportCore.SocketAddress,
         serverQuiescingHelper: ServerQuiescingHelper
       ) async throws -> NIOAsyncChannel<AcceptedChannel, Never> {
         let sslContext: NIOSSLContext?
@@ -104,7 +118,7 @@ extension HTTP2ServerTransport {
               on: channel
             )
           }
-          .bind(to: address) { channel in
+          .bind(to: self.address) { channel in
             channel.eventLoop.makeCompletedFuture {
               if let sslContext {
                 if let callback = customVerificationCallback {
@@ -180,13 +194,52 @@ extension HTTP2ServerTransport {
       config: Config = .defaults,
       eventLoopGroup: MultiThreadedEventLoopGroup = .singletonMultiThreadedEventLoopGroup
     ) {
-      let factory = ListenerFactory(config: config, transportSecurity: transportSecurity)
-      let helper = ServerQuiescingHelper(group: eventLoopGroup)
+      self.init(
+        address: .socketAddress(address),
+        transportSecurity: transportSecurity,
+        config: config,
+        eventLoopGroup: eventLoopGroup
+      )
+    }
+
+    /// Create a new `Posix` transport.
+    /// 
+    /// - Parameters:
+    ///   - fileDescriptor: The file descriptor of an already bound listening socket.
+    ///   - transportSecurity: The configuration for securing network traffic.
+    ///   - config: The transport configuration.
+    ///   - eventLoopGroup: The ELG from which to get ELs to run this transport.
+    /// - Important: gRPC takes ownership of the `fileDescriptor` passed in, you *must not* close
+    ///   the descriptor manually.
+    public init(
+      listeningSocketDescriptor fileDescriptor: Int,
+      transportSecurity: TransportSecurity,
+      config: Config = .defaults,
+      eventLoopGroup: MultiThreadedEventLoopGroup = .singletonMultiThreadedEventLoopGroup
+    ) {
+      self.init(
+        address: .listeningSocket(fileDescriptor),
+        transportSecurity: transportSecurity,
+        config: config,
+        eventLoopGroup: eventLoopGroup
+      )
+    }
+
+    private init(
+      address: ListenerFactory.Address,
+      transportSecurity: TransportSecurity,
+      config: Config = .defaults,
+      eventLoopGroup: MultiThreadedEventLoopGroup = .singletonMultiThreadedEventLoopGroup
+    ) {
       self.underlyingTransport = CommonHTTP2ServerTransport(
-        address: address,
+        address: address.socketAddress,
         eventLoopGroup: eventLoopGroup,
-        quiescingHelper: helper,
-        listenerFactory: factory
+        quiescingHelper: ServerQuiescingHelper(group: eventLoopGroup),
+        listenerFactory: ListenerFactory(
+          address: address,
+          config: config,
+          transportSecurity: transportSecurity
+        )
       ) { channel in
         var context = HTTP2ServerTransport.Posix.Context()
 
@@ -311,26 +364,36 @@ extension HTTP2ServerTransport.Posix {
 @available(gRPCSwiftNIOTransport 2.0, *)
 extension ServerBootstrap {
   fileprivate func bind<Output: Sendable>(
-    to address: GRPCNIOTransportCore.SocketAddress,
+    to address: HTTP2ServerTransport.Posix.ListenerFactory.Address,
     childChannelInitializer: @escaping @Sendable (any Channel) -> EventLoopFuture<Output>
   ) async throws -> NIOAsyncChannel<Output, Never> {
-    if let virtualSocket = address.virtualSocket {
+    switch address {
+    case .socketAddress(let address):
+      if let virtualSocket = address.virtualSocket {
+        return try await self.bind(
+          to: VsockAddress(virtualSocket),
+          childChannelInitializer: childChannelInitializer
+        )
+      } else if let uds = address.unixDomainSocket {
+        return try await self.bind(
+          unixDomainSocketPath: uds.path,
+          cleanupExistingSocketFile: true,
+          childChannelInitializer: childChannelInitializer
+        )
+      } else {
+        return try await self.bind(
+          to: NIOCore.SocketAddress(address),
+          childChannelInitializer: childChannelInitializer
+        )
+      }
+
+    case .listeningSocket(let descriptor):
       return try await self.bind(
-        to: VsockAddress(virtualSocket),
-        childChannelInitializer: childChannelInitializer
-      )
-    } else if let uds = address.unixDomainSocket {
-      return try await self.bind(
-        unixDomainSocketPath: uds.path,
-        cleanupExistingSocketFile: true,
-        childChannelInitializer: childChannelInitializer
-      )
-    } else {
-      return try await self.bind(
-        to: NIOCore.SocketAddress(address),
+        NIOBSDSocket.Handle(descriptor),
         childChannelInitializer: childChannelInitializer
       )
     }
+
   }
 }
 
@@ -353,6 +416,31 @@ extension ServerTransport where Self == HTTP2ServerTransport.Posix {
   ) -> Self {
     return HTTP2ServerTransport.Posix(
       address: address,
+      transportSecurity: transportSecurity,
+      config: config,
+      eventLoopGroup: eventLoopGroup
+    )
+  }
+
+  /// Create a new `Posix` based HTTP/2 server transport.
+  ///
+  /// - Parameters:
+  ///   - fileDescriptor: The file descriptor of an already bound listening socket.
+  ///   - transportSecurity: The configuration for securing network traffic.
+  ///   - config: The transport configuration.
+  ///   - eventLoopGroup: The underlying NIO `EventLoopGroup` to the server on. This must
+  ///       be a `MultiThreadedEventLoopGroup` or an `EventLoop` from
+  ///       a `MultiThreadedEventLoopGroup`.
+  /// - Important: gRPC takes ownership of the `fileDescriptor` passed in, you *must not* close
+  ///   the descriptor manually.
+  public static func http2NIOPosix(
+    listeningSocketDescriptor fileDescriptor: Int,
+    transportSecurity: HTTP2ServerTransport.Posix.TransportSecurity,
+    config: HTTP2ServerTransport.Posix.Config = .defaults,
+    eventLoopGroup: MultiThreadedEventLoopGroup = .singletonMultiThreadedEventLoopGroup
+  ) -> Self {
+    return HTTP2ServerTransport.Posix(
+      listeningSocketDescriptor: fileDescriptor,
       transportSecurity: transportSecurity,
       config: config,
       eventLoopGroup: eventLoopGroup

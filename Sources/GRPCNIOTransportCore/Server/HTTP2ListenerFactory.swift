@@ -29,7 +29,6 @@ package protocol HTTP2ListenerFactory: Sendable {
 
   func makeListeningChannel(
     eventLoopGroup: any EventLoopGroup,
-    address: SocketAddress,
     serverQuiescingHelper: ServerQuiescingHelper
   ) async throws -> NIOAsyncChannel<AcceptedChannel, Never>
 }

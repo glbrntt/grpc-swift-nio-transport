@@ -33,12 +33,12 @@ extension HTTP2ServerTransport {
     public typealias Bytes = GRPCNIOTransportBytes
 
     private struct ListenerFactory: HTTP2ListenerFactory {
+      let address: GRPCNIOTransportCore.SocketAddress
       let config: Config
       let transportSecurity: TransportSecurity
 
       func makeListeningChannel(
         eventLoopGroup: any EventLoopGroup,
-        address: GRPCNIOTransportCore.SocketAddress,
         serverQuiescingHelper: ServerQuiescingHelper
       ) async throws -> NIOAsyncChannel<AcceptedChannel, Never> {
         let bootstrap: NIOTSListenerBootstrap
@@ -72,7 +72,7 @@ extension HTTP2ServerTransport {
               on: channel
             )
           }
-          .bind(to: address) { channel in
+          .bind(to: self.address) { channel in
             return channel.eventLoop.makeCompletedFuture {
               try channel.pipeline.syncOperations.configureGRPCServerPipeline(
                 channel: channel,
@@ -122,13 +122,15 @@ extension HTTP2ServerTransport {
       config: Config = .defaults,
       eventLoopGroup: NIOTSEventLoopGroup = .singletonNIOTSEventLoopGroup
     ) {
-      let factory = ListenerFactory(config: config, transportSecurity: transportSecurity)
-      let helper = ServerQuiescingHelper(group: eventLoopGroup)
       self.underlyingTransport = CommonHTTP2ServerTransport(
         address: address,
         eventLoopGroup: eventLoopGroup,
-        quiescingHelper: helper,
-        listenerFactory: factory
+        quiescingHelper: ServerQuiescingHelper(group: eventLoopGroup),
+        listenerFactory: ListenerFactory(
+          address: address,
+          config: config,
+          transportSecurity: transportSecurity
+        )
       )
     }
 

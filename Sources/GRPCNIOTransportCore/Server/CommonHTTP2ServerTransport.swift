@@ -30,7 +30,7 @@ package final class CommonHTTP2ServerTransport<
   package typealias Bytes = GRPCNIOTransportBytes
 
   private let eventLoopGroup: any EventLoopGroup
-  private let address: SocketAddress
+  private let address: SocketAddress?
   private let listeningAddressState: Mutex<State>
   private let serverQuiescingHelper: ServerQuiescingHelper
   private let factory: ListenerFactory
@@ -64,24 +64,25 @@ package final class CommonHTTP2ServerTransport<
 
     mutating func addressBound(
       _ address: NIOCore.SocketAddress?,
-      userProvidedAddress: SocketAddress
+      userProvidedAddress: SocketAddress?
     ) -> OnBound {
       switch self {
       case .idle(let listeningAddressPromise):
         if let address {
           self = .listening(listeningAddressPromise.futureResult)
           return .succeedPromise(listeningAddressPromise, address: SocketAddress(address))
-        } else if userProvidedAddress.virtualSocket != nil {
+        } else if let userProvidedAddress, userProvidedAddress.virtualSocket != nil {
           self = .listening(listeningAddressPromise.futureResult)
           return .succeedPromise(listeningAddressPromise, address: userProvidedAddress)
         } else {
-          assertionFailure("Unknown address type")
-          let invalidAddressError = RuntimeError(
+          // In some cases (such as starting the server from an fd, it might not be possible to get
+          // a socket address).
+          let unavailableAddress = RuntimeError(
             code: .transportError,
-            message: "Unknown address type returned by transport."
+            message: "Listener address isn't available. It may not correspond to a socket address."
           )
-          self = .closedOrInvalidAddress(invalidAddressError)
-          return .failPromise(listeningAddressPromise, error: invalidAddressError)
+          self = .closedOrInvalidAddress(unavailableAddress)
+          return .failPromise(listeningAddressPromise, error: unavailableAddress)
         }
 
       case .listening, .closedOrInvalidAddress:
@@ -134,7 +135,7 @@ package final class CommonHTTP2ServerTransport<
   }
 
   package init(
-    address: SocketAddress,
+    address: SocketAddress?,
     eventLoopGroup: any EventLoopGroup,
     quiescingHelper: ServerQuiescingHelper,
     listenerFactory: ListenerFactory,
@@ -183,7 +184,6 @@ package final class CommonHTTP2ServerTransport<
 
     let serverChannel = try await self.factory.makeListeningChannel(
       eventLoopGroup: self.eventLoopGroup,
-      address: self.address,
       serverQuiescingHelper: self.serverQuiescingHelper
     )
 
