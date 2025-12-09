@@ -57,10 +57,11 @@ extension HTTP2ServerTransport {
   public struct Posix: ServerTransport, ListeningServerTransport {
     public typealias Bytes = GRPCNIOTransportBytes
 
-    struct ListenerFactory: HTTP2ListenerFactory {
+    struct ListenerFactory: HTTP2ServerTransport.ListenerFactory {
       let address: Address
       let config: Config
       let transportSecurity: TransportSecurity
+      let eventLoopGroup: any EventLoopGroup
 
       enum Address {
         case socketAddress(GRPCNIOTransportCore.SocketAddress)
@@ -77,9 +78,11 @@ extension HTTP2ServerTransport {
       }
 
       func makeListeningChannel(
-        eventLoopGroup: any EventLoopGroup,
-        serverQuiescingHelper: ServerQuiescingHelper
-      ) async throws -> NIOAsyncChannel<AcceptedChannel, Never> {
+        listenerParameters: HTTP2ServerTransport.ListenerParameters,
+        connectionParameters: HTTP2ServerTransport.ConnectionParameters
+      ) async throws -> NIOAsyncChannel<HTTP2ServerTransport.ConnectionChannel, Never> {
+        let usesTLS: Bool
+        let requireALPN: Bool
         let sslContext: NIOSSLContext?
         let customVerificationCallback:
           (
@@ -90,8 +93,11 @@ extension HTTP2ServerTransport {
 
         switch self.transportSecurity.wrapped {
         case .plaintext:
+          usesTLS = false
+          requireALPN = false
           sslContext = nil
           customVerificationCallback = nil
+
         case .tls(let tlsConfig):
           do {
             sslContext = try NIOSSLContext(configuration: TLSConfiguration(tlsConfig))
@@ -102,64 +108,47 @@ extension HTTP2ServerTransport {
               cause: error
             )
           }
+          usesTLS = true
+          requireALPN = tlsConfig.requireALPN
           customVerificationCallback = tlsConfig.customVerificationCallback
         }
 
-        let serverChannel = try await ServerBootstrap(group: eventLoopGroup)
+        let serverChannel = try await ServerBootstrap(group: self.eventLoopGroup)
           .serverChannelOption(.socketOption(.so_reuseaddr), value: 1)
           .serverChannelInitializer { channel in
-            return channel.eventLoop.makeCompletedFuture {
-              let quiescingHandler = serverQuiescingHelper.makeServerChannelHandler(
-                channel: channel
-              )
-              try channel.pipeline.syncOperations.addHandler(quiescingHandler)
-            }.runInitializerIfSet(
-              self.config.channelDebuggingCallbacks.onBindTCPListener,
-              on: channel
+            listenerParameters.configureListener(
+              channel: channel,
+              debuggingCallbacks: self.config.channelDebuggingCallbacks
             )
           }
           .bind(to: self.address) { channel in
-            channel.eventLoop.makeCompletedFuture {
-              if let sslContext {
-                if let callback = customVerificationCallback {
-                  try channel.pipeline.syncOperations.addHandler(
-                    NIOSSLServerHandler(
-                      context: sslContext,
-                      customVerificationCallbackWithMetadata: callback
-                    )
-                  )
-                } else {
-                  try channel.pipeline.syncOperations.addHandler(
-                    NIOSSLServerHandler(context: sslContext)
-                  )
-                }
-              }
+            let sslHandler: NIOSSLServerHandler?
 
-              let requireALPN: Bool
-              let scheme: Scheme
-              switch self.transportSecurity.wrapped {
-              case .plaintext:
-                requireALPN = false
-                scheme = .http
-              case .tls(let tlsConfig):
-                requireALPN = tlsConfig.requireALPN
-                scheme = .https
+            if let sslContext {
+              if let callback = customVerificationCallback {
+                sslHandler = NIOSSLServerHandler(
+                  context: sslContext,
+                  customVerificationCallbackWithMetadata: callback
+                )
+              } else {
+                sslHandler = NIOSSLServerHandler(context: sslContext)
               }
+            } else {
+              sslHandler = nil
+            }
 
-              return try channel.pipeline.syncOperations.configureGRPCServerPipeline(
-                channel: channel,
-                compressionConfig: self.config.compression,
-                connectionConfig: self.config.connection,
-                http2Config: self.config.http2,
-                rpcConfig: self.config.rpc,
-                debugConfig: self.config.channelDebuggingCallbacks,
-                requireALPN: requireALPN,
-                scheme: scheme
-              )
-            }.runInitializerIfSet(
-              self.config.channelDebuggingCallbacks.onAcceptTCPConnection,
-              on: channel
+            return connectionParameters.configureConnection(
+              channel: channel,
+              sslHandler: sslHandler,
+              compressionConfig: self.config.compression,
+              connectionConfig: self.config.connection,
+              http2Config: self.config.http2,
+              rpcConfig: self.config.rpc,
+              debuggingCallbacks: self.config.channelDebuggingCallbacks,
+              usesTLS: usesTLS,
+              requireALPN: requireALPN
             )
+
           }
 
         return serverChannel
@@ -238,7 +227,8 @@ extension HTTP2ServerTransport {
         listenerFactory: ListenerFactory(
           address: address,
           config: config,
-          transportSecurity: transportSecurity
+          transportSecurity: transportSecurity,
+          eventLoopGroup: eventLoopGroup
         )
       ) { channel in
         var context = HTTP2ServerTransport.Posix.Context()

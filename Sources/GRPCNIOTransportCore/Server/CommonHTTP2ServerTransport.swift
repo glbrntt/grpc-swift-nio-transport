@@ -22,14 +22,13 @@ private import Synchronization
 
 /// Provides the common functionality for a `NIO`-based server transport.
 ///
-/// - SeeAlso: ``ListenerFactory``.
+/// - SeeAlso: ``HTTP2ListenerFactory``.
 @available(gRPCSwiftNIOTransport 2.0, *)
 package final class CommonHTTP2ServerTransport<
-  ListenerFactory: HTTP2ListenerFactory
+  ListenerFactory: HTTP2ServerTransport.ListenerFactory
 >: ServerTransport, ListeningServerTransport {
   package typealias Bytes = GRPCNIOTransportBytes
 
-  private let eventLoopGroup: any EventLoopGroup
   private let address: SocketAddress?
   private let listeningAddressState: Mutex<State>
   private let serverQuiescingHelper: ServerQuiescingHelper
@@ -143,7 +142,6 @@ package final class CommonHTTP2ServerTransport<
       @Sendable (any Channel) async -> any ServerContext.TransportSpecific
     )? = nil
   ) {
-    self.eventLoopGroup = eventLoopGroup
     self.address = address
 
     let eventLoop = eventLoopGroup.any()
@@ -183,8 +181,8 @@ package final class CommonHTTP2ServerTransport<
     }
 
     let serverChannel = try await self.factory.makeListeningChannel(
-      eventLoopGroup: self.eventLoopGroup,
-      serverQuiescingHelper: self.serverQuiescingHelper
+      listenerParameters: HTTP2ServerTransport.ListenerParameters(quiescingHelper: self.serverQuiescingHelper),
+      connectionParameters: HTTP2ServerTransport.ConnectionParameters()
     )
 
     let action = self.listeningAddressState.withLock {
@@ -202,11 +200,11 @@ package final class CommonHTTP2ServerTransport<
 
     try await serverChannel.executeThenClose { inbound in
       try await withThrowingDiscardingTaskGroup { group in
-        for try await (connectionChannel, streamMultiplexer) in inbound {
+        for try await configuredConnection in inbound {
           group.addTask {
             try await self.handleConnection(
-              connectionChannel,
-              multiplexer: streamMultiplexer,
+              configuredConnection.connection,
+              multiplexer: configuredConnection.multiplexer,
               streamHandler: streamHandler
             )
           }

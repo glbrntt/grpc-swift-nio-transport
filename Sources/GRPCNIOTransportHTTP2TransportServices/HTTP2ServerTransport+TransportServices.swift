@@ -32,29 +32,30 @@ extension HTTP2ServerTransport {
   public struct TransportServices: ServerTransport, ListeningServerTransport {
     public typealias Bytes = GRPCNIOTransportBytes
 
-    private struct ListenerFactory: HTTP2ListenerFactory {
+    private struct ListenerFactory: HTTP2ServerTransport.ListenerFactory {
       let address: GRPCNIOTransportCore.SocketAddress
       let config: Config
       let transportSecurity: TransportSecurity
+      let eventLoopGroup: any EventLoopGroup
 
       func makeListeningChannel(
-        eventLoopGroup: any EventLoopGroup,
-        serverQuiescingHelper: ServerQuiescingHelper
-      ) async throws -> NIOAsyncChannel<AcceptedChannel, Never> {
+        listenerParameters: HTTP2ServerTransport.ListenerParameters,
+        connectionParameters: HTTP2ServerTransport.ConnectionParameters
+      ) async throws -> NIOAsyncChannel<HTTP2ServerTransport.ConnectionChannel, Never> {
         let bootstrap: NIOTSListenerBootstrap
 
         let requireALPN: Bool
-        let scheme: Scheme
+        let usesTLS: Bool
         switch self.transportSecurity.wrapped {
         case .plaintext:
           requireALPN = false
-          scheme = .http
-          bootstrap = NIOTSListenerBootstrap(group: eventLoopGroup)
+          usesTLS = false
+          bootstrap = NIOTSListenerBootstrap(group: self.eventLoopGroup)
 
         case .tls(let tlsConfig):
           requireALPN = tlsConfig.requireALPN
-          scheme = .https
-          bootstrap = NIOTSListenerBootstrap(group: eventLoopGroup)
+          usesTLS = true
+          bootstrap = NIOTSListenerBootstrap(group: self.eventLoopGroup)
             .tlsOptions(try NWProtocolTLS.Options(tlsConfig))
         }
 
@@ -62,31 +63,21 @@ extension HTTP2ServerTransport {
           try await bootstrap
           .serverChannelOption(.socketOption(.so_reuseaddr), value: 1)
           .serverChannelInitializer { channel in
-            channel.eventLoop.makeCompletedFuture {
-              let quiescingHandler = serverQuiescingHelper.makeServerChannelHandler(
-                channel: channel
-              )
-              try channel.pipeline.syncOperations.addHandler(quiescingHandler)
-            }.runInitializerIfSet(
-              self.config.channelDebuggingCallbacks.onBindTCPListener,
-              on: channel
+            listenerParameters.configureListener(
+              channel: channel,
+              debuggingCallbacks: self.config.channelDebuggingCallbacks
             )
           }
           .bind(to: self.address) { channel in
-            return channel.eventLoop.makeCompletedFuture {
-              try channel.pipeline.syncOperations.configureGRPCServerPipeline(
-                channel: channel,
-                compressionConfig: self.config.compression,
-                connectionConfig: self.config.connection,
-                http2Config: self.config.http2,
-                rpcConfig: self.config.rpc,
-                debugConfig: self.config.channelDebuggingCallbacks,
-                requireALPN: requireALPN,
-                scheme: scheme
-              )
-            }.runInitializerIfSet(
-              self.config.channelDebuggingCallbacks.onAcceptTCPConnection,
-              on: channel
+            connectionParameters.configureConnection(
+              channel: channel,
+              compressionConfig: self.config.compression,
+              connectionConfig: self.config.connection,
+              http2Config: self.config.http2,
+              rpcConfig: self.config.rpc,
+              debuggingCallbacks: self.config.channelDebuggingCallbacks,
+              usesTLS: usesTLS,
+              requireALPN: requireALPN
             )
           }
 
@@ -129,7 +120,8 @@ extension HTTP2ServerTransport {
         listenerFactory: ListenerFactory(
           address: address,
           config: config,
-          transportSecurity: transportSecurity
+          transportSecurity: transportSecurity,
+          eventLoopGroup: eventLoopGroup
         )
       )
     }
