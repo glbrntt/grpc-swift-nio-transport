@@ -70,7 +70,13 @@ extension GRPCClientStreamHandler {
       let endStream = frameData.endStream
       switch frameData.data {
       case .byteBuffer(let buffer):
-        switch self.stateMachine.receive(buffer: buffer, endStream: endStream) {
+        let stateBefore = self.stateMachine.stateName
+        let action = self.stateMachine.receive(buffer: buffer, endStream: endStream)
+        print(
+          "client channelRead data endStream=\(endStream) "
+            + "\(stateBefore) -> \(self.stateMachine.stateName) action=\(action)"
+        )
+        switch action {
         case .endRPCAndForwardErrorStatus_clientOnly(let status):
           context.fireChannelRead(self.wrapInboundOut(.status(status, [:])))
           context.close(promise: nil)
@@ -105,9 +111,14 @@ extension GRPCClientStreamHandler {
 
     case .headers(let headers):
       do {
+        let stateBefore = self.stateMachine.stateName
         let action = try self.stateMachine.receive(
           headers: headers.headers,
           endStream: headers.endStream
+        )
+        print(
+          "client channelRead headers endStream=\(headers.endStream) "
+            + "\(stateBefore) -> \(self.stateMachine.stateName) action=\(action)"
         )
         switch action {
         case .receivedMetadata(let metadata, _):
@@ -132,6 +143,7 @@ extension GRPCClientStreamHandler {
       }
 
     case .rstStream(let errorCode):
+      print("client channelRead rstStream \(errorCode) state=\(self.stateMachine.stateName)")
       self.handleUnexpectedInboundClose(context: context, reason: .streamReset(errorCode))
 
     case .ping, .goAway, .priority, .settings, .pushPromise, .windowUpdate,
@@ -153,6 +165,7 @@ extension GRPCClientStreamHandler {
   }
 
   func channelInactive(context: ChannelHandlerContext) {
+    print("client channelInactive state=\(self.stateMachine.stateName)")
     self.handleUnexpectedInboundClose(context: context, reason: .channelInactive)
     context.fireChannelInactive()
   }
@@ -169,6 +182,7 @@ extension GRPCClientStreamHandler {
   }
 
   func errorCaught(context: ChannelHandlerContext, error: any Error) {
+    print("client errorCaught state=\(self.stateMachine.stateName) error=\(error)")
     self.handleUnexpectedInboundClose(context: context, reason: .errorThrown(error))
     // Close the channel so the HTTP/2 stream terminates (RST_STREAM). Without this,
     // 'executeThenClose' would wait for 'closeFuture' which would never complete because
@@ -203,6 +217,7 @@ extension GRPCClientStreamHandler {
         case .write(let headers):
           context.write(self.wrapOutboundOut(.headers(.init(headers: headers))), promise: promise)
         case .failPromise(let error):
+          print("client write metadata DROPPED (poisoned) state=\(self.stateMachine.stateName)")
           promise?.fail(error)
         }
       } catch let invalidState {
@@ -219,6 +234,7 @@ extension GRPCClientStreamHandler {
         case .succeedPromise:
           promise?.succeed()
         case .failPromise(let error):
+          print("client write message DROPPED state=\(self.stateMachine.stateName)")
           promise?.fail(error)
         }
       } catch let invalidState {
@@ -230,6 +246,7 @@ extension GRPCClientStreamHandler {
   }
 
   func close(context: ChannelHandlerContext, mode: CloseMode, promise: EventLoopPromise<Void>?) {
+    let stateBefore = self.stateMachine.stateName
     switch mode {
     case .input:
       context.fireUserInboundEventTriggered(ChannelEvent.inputClosed)
@@ -242,6 +259,9 @@ extension GRPCClientStreamHandler {
       // to close the whole channel (as the mode is ignored in its implementation).
       do {
         try self.stateMachine.closeOutbound()
+        print(
+          "client close(.output) \(stateBefore) -> \(self.stateMachine.stateName)"
+        )
         // Force a flush by calling _flush instead of flush
         // (otherwise, we'd skip flushing if we're in a read loop)
         self._flush(context: context)
@@ -257,6 +277,9 @@ extension GRPCClientStreamHandler {
       // down the pipeline.
       do {
         try self.stateMachine.closeOutbound()
+        print(
+          "client close(.all) \(stateBefore) -> \(self.stateMachine.stateName)"
+        )
         // Force a flush by calling _flush
         // (otherwise, we'd skip flushing if we're in a read loop)
         self._flush(context: context)
@@ -292,6 +315,10 @@ extension GRPCClientStreamHandler {
 
       switch action {
       case .sendFrame(let byteBuffer, let endStream, let promise):
+        print(
+          "client _flush sendFrame endStream=\(endStream) "
+            + "bytes=\(byteBuffer.readableBytes) state=\(self.stateMachine.stateName)"
+        )
         let data = HTTP2Frame.FramePayload.Data(
           data: .byteBuffer(byteBuffer),
           endStream: endStream
@@ -304,6 +331,7 @@ extension GRPCClientStreamHandler {
         break loop
 
       case .noMoreMessages:
+        print("client _flush noMoreMessages state=\(self.stateMachine.stateName)")
         // No more messages means EOS so always flush.
         flush = true
         break loop

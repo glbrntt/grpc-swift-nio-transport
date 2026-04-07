@@ -528,6 +528,10 @@ struct GRPCStreamStateMachine {
   private var configuration: GRPCStreamStateMachineConfiguration
   private var skipAssertions: Bool
 
+  var stateName: String {
+    self.state.name
+  }
+
   /// The state transition isn't possible by construction.
   struct UnreachableTransition: Error {
     var message: String
