@@ -23,6 +23,20 @@ import XCTest
 
 import protocol NIOCore.Channel
 
+#if canImport(Glibc)
+import Glibc
+#elseif canImport(Darwin)
+import Darwin
+#endif
+
+private func _debugLog(_ message: @autoclosure () -> String) {
+  var msg = message() + "\n"
+  msg.withUTF8 {
+    let fd = STDERR_FILENO
+    _ = write(fd, $0.baseAddress, $0.count)
+  }
+}
+
 #if canImport(FoundationEssentials)
 import FoundationEssentials
 #else
@@ -55,6 +69,7 @@ final class HTTP2TransportTests: XCTestCase {
     ) async throws -> Void
   ) async throws {
     for pair in transport {
+      _debugLog("[\(pair)] setup: starting server")
       try await withThrowingTaskGroup(of: Void.self) { group in
         let (server, address) = try await self.runServer(
           in: &group,
@@ -63,6 +78,7 @@ final class HTTP2TransportTests: XCTestCase {
           enableControlService: enableControlService,
           compression: serverCompression
         )
+        _debugLog("[\(pair)] setup: server listening on \(address)")
 
         let target: any ResolvableTarget
         if let ipv4 = address.ipv4 {
@@ -76,6 +92,7 @@ final class HTTP2TransportTests: XCTestCase {
           return
         }
 
+        _debugLog("[\(pair)] setup: creating client")
         let client = try self.makeClient(
           kind: pair.client,
           target: target,
@@ -86,6 +103,7 @@ final class HTTP2TransportTests: XCTestCase {
         group.addTask {
           try await client.runConnections()
         }
+        _debugLog("[\(pair)] setup: client started, running test body")
 
         do {
           let control = ControlClient(wrapping: client)
@@ -94,9 +112,11 @@ final class HTTP2TransportTests: XCTestCase {
           XCTFail("Unexpected error: '\(error)' (\(pair))")
         }
 
+        _debugLog("[\(pair)] teardown: beginning graceful shutdown")
         server.beginGracefulShutdown()
         client.beginGracefulShutdown()
       }
+      _debugLog("[\(pair)] teardown: complete")
     }
   }
 
@@ -105,6 +125,7 @@ final class HTTP2TransportTests: XCTestCase {
     _ execute: (ControlClient<NIOClientTransport>, TransportKind) async throws -> Void
   ) async throws {
     for clientKind in kind {
+      _debugLog("[httpStatusCode/\(clientKind)] setup: starting server")
       try await withThrowingTaskGroup(of: Void.self) { group in
         let server = HTTP2StatusCodeServer()
         group.addTask {
@@ -112,6 +133,7 @@ final class HTTP2TransportTests: XCTestCase {
         }
 
         let address = try await server.listeningAddress
+        _debugLog("[httpStatusCode/\(clientKind)] setup: server listening on \(address)")
         let client = try self.makeClient(
           kind: clientKind,
           target: .ipv4(address: address.host, port: address.port),
@@ -121,6 +143,7 @@ final class HTTP2TransportTests: XCTestCase {
         group.addTask {
           try await client.runConnections()
         }
+        _debugLog("[httpStatusCode/\(clientKind)] setup: client started, running test body")
 
         do {
           let control = ControlClient(wrapping: client)
@@ -129,8 +152,10 @@ final class HTTP2TransportTests: XCTestCase {
           XCTFail("Unexpected error: '\(error)' (\(clientKind))")
         }
 
+        _debugLog("[httpStatusCode/\(clientKind)] teardown: cancelAll")
         group.cancelAll()
       }
+      _debugLog("[httpStatusCode/\(clientKind)] teardown: complete")
     }
   }
 
