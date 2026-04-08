@@ -40,6 +40,18 @@ final class BufferInboundUntilFlush: ChannelDuplexHandler {
     self.isBuffering = true
   }
 
+  private func unbuffer(context: ChannelHandlerContext) {
+    self.isBuffering = false
+    if let buffered = self.accumulated.take() {
+      // Schedule on the next event loop tick to avoid re-entrancy: this flush
+      // originates from the HTTP/2 handler writing its connection preface, so
+      // firing channelRead back into it here would be re-entrant.
+      let wrapped = self.wrapInboundOut(buffered)
+      context.fireChannelRead(wrapped)
+      context.fireChannelReadComplete()
+    }
+  }
+
   func channelRead(context: ChannelHandlerContext, data: NIOAny) {
     if self.isBuffering {
       let buffer = self.unwrapInboundIn(data)
@@ -49,12 +61,16 @@ final class BufferInboundUntilFlush: ChannelDuplexHandler {
     }
   }
 
+  func channelReadComplete(context: ChannelHandlerContext) {
+    if !self.isBuffering {
+      context.fireChannelReadComplete()
+    }
+  }
+
   func flush(context: ChannelHandlerContext) {
     if self.isBuffering {
-      self.isBuffering = false
-      if let buffered = self.accumulated.take() {
-        context.fireChannelRead(self.wrapInboundOut(buffered))
-        context.fireChannelReadComplete()
+      context.eventLoop.assumeIsolated().execute {
+        self.unbuffer(context: context)
       }
     }
 
