@@ -54,6 +54,7 @@ final class BufferInboundUntilFlush: ChannelDuplexHandler {
       self.isBuffering = false
       if let buffered = self.accumulated.take() {
         context.fireChannelRead(self.wrapInboundOut(buffered))
+        context.fireChannelReadComplete()
       }
     }
 
